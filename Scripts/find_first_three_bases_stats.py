@@ -73,6 +73,7 @@ print("1\t" + str(oneA) + "\t" + str(oneG) + "\t" + str(oneT) + "\t" + str(oneC)
 print("2\t" + str(twoA) + "\t" + str(twoG) + "\t" + str(twoT) + "\t" + str(twoC))
 print("3\t" + str(thrA) + "\t" + str(thrG) + "\t" + str(thrT) + "\t" + str(thrC))
 
+print("Number of Transcripts Processed:", i)
 peroneA=str((oneA/i)*100)
 peroneG=str((oneG/i)*100)
 peroneT=str((oneT/i)*100)
