@@ -1,0 +1,501 @@
+#!/usr/bin/env python
+
+import math
+import multiprocessing as mp
+import os.path
+import random
+import sys
+import time
+
+from optparse import OptionParser
+from cgatcore import experiment as E
+from cgatcore import iotools
+from numpy import array, arange, average
+from numpy.random import choice
+from scipy.stats import truncnorm
+from types import SimpleNamespace
+
+
+def main():
+    parser = OptionParser(
+        description='''Input configs for duplication rate modelling. If no options are set program-level configuration will be used,
+                     otherwise any commands and defaults will be used.
+                     
+                     IMPORTANT OPTIONS:
+                     --stdout=FILENAME - Redirects output to specified file path.
+                     --log=LOGFILE - Redirects log output to file at specified path to ensure output is clean.
+                     
+                     A basic run using the read length distribution stored in sample/libParams/flenDist.txt on a single salmon input file looks like below:
+                     SpotDup -a -f ./sample_quantification.sf --stdout=sample_duplication.results --log=sample_dupmodel.log
+                     
+                     ''')
+    ###Basic parameters
+    parser.add_option("-g", "--gene-length", type=int, default=1500,
+                      help="Set length of gene from which to generate reads. Defaults to 1500.")
+    parser.add_option("-m", "--mean", type=int, default=200,
+                      help="Set mean read length for generation. Defaults to 200.")
+    parser.add_option("-s", "--stand-dev", type=int, default=30,
+                      help="Sets standard deviation of read lengths. Defaults to 30.")
+    parser.add_option("-r", "--no-repeats", type=int, default=1000,
+                      help="Sets number of repeats. Defaults to 1000.")
+    parser.add_option("-x", "--function", default="",
+                      help="Sets the function to use. Defaults to None.")
+    parser.add_option("-y", "--processors", type=int, default=1,
+                      help='''If set to > 1 then multiprocessing will be used. Sets the number of processors to be 
+                                used. Defaults to 1.''')
+    ###More advanced function options
+    parser.add_option("-l", "--max-loops", type=int, default=1000,
+                      help='''Sets max number of loops for dup_rate_calc_repeater and max value for looper. Defaults 
+                              to 1000.''')
+    parser.add_option("-i", "--interval", type=int, default=100,
+                      help="Sets interval of dup_rate_calc looper. Defaults to 100.")
+    parser.add_option("-a", "--alt-read-gen", action='store_true', default=False,
+                      help='''Sets method of read gen to use a weighted distribution. If set requires a single line,
+                                tab or space separated, distribution expected by default in
+                                SAMPLENAME/libParams/flenDist.txt (See -dp for more).''')
+    ###User Aid
+    #parser.add_option("-z", "--do_not_stop", action="store_true", default=False,
+    #                  help="Prevents experiment from stopping (for running the program with external parsers.)")
+    ###sf Files
+    parser.add_option("-f", "--sf-file-name", default="none",
+                      help="Sets the sf file to use with the other selected functions. Defaults to no file.")
+    parser.add_option("-d", "--sf-file-dir", default="none",
+                      help='''Sets the directory of sf files to use with the other selected functions. Defaults to no 
+                                directory.''')
+    parser.add_option("-p", "--dist-path", default="/libParams/flenDist.txt",
+                      help='''Sets the path to the distribution file. Looks for the form SAMPLENAME + path. If none is
+                        set, defaults to searching standard salmon folder of SAMPLENAME/libParams/flenDist.txt''')
+    ###Bias
+    parser.add_option("-b", "--bias-method", default="1",
+                      help='''Choose method for bias. If a method is selected MUST ALSO SET -gc AND -seq Defaults to 
+                                1.''')  # Add bias method types and names as made.
+    parser.add_option("-c", "--gc-bias", type=int, default=0,
+                      help="Sets level of gc bias. If at 0 no bias calculation is attempted. Defaults to 0.")
+    parser.add_option("-q", "--sequence-file", default="none",
+                      help='''Sets the sequence file to use if modelling gc bias with the other selected functions."
+                             "Defaults to no file.''')
+
+    ###Compile args_dict and convert to a dictionary.
+    args_dict, placeargs = E.start(parser)
+    args_dict = args_dict.__dict__
+    usage = "usage: %prog requires arguments as shown in help." # TODO: Update this to something useful
+
+    ###Add non-user configurable key:value pairs to the dictionary (sample wide duplication rate calculation)
+    args_dict['sw_no_repeats'] = 0
+    args_dict['sw_len_reads_set'] = 0
+
+    ###Check if a sequence file is required that a path to a real file has been provided
+    if not os.path.isfile(args_dict["sequence_file"]) and args_dict["gc_bias"] != 0:
+        print("Please provide a suitable sequence file.")
+        sys.exit()
+    else:
+        pass
+
+    E.debug("Running: {0}".format(args_dict["function"]))
+
+    ###Get variables from args_dict. Assign them to a Namespace to prevent global/local variable issues.
+    a = SimpleNamespace(**args_dict)
+    E.debug(a)
+
+    ###If the program is run with no options.
+    if len(sys.argv) == 1:
+        print("")
+        print("")
+        print(
+            "PCR_dup_modeller run with no options. Please see defaults above and change as required. See -h for more.")
+        print("")
+        print("")
+
+
+    ###Run plain functions if only one processor is availible or implement multiprocessing if more cores are availible.
+    if args_dict['processors'] != 1:
+        mp_dup_rate_calc(args_dict)
+    else:
+        if a.sf_file_name != "none":
+            args_dict = sf_parser(a.sf_file_name, args_dict, weights_file=None)
+        if a.sf_file_dir != "none":
+            sf_directory_parser(a.sf_file_dir, args_dict)
+        if a.function == "read_gen":
+            read = read_gen(a.mean, a.stand_dev, a.gene_length)
+        if a.function == "alt_read_gen":
+            read = alt_read_gen(frag_len_list, weight_data)
+            E.debug("READ IS: {0}".format(str(read)))
+        if a.function == "dup_rate_calc":
+            duplication_rate, len_reads_set = dup_rate_calc(a.gene_length, a.no_repeats, a.mean, a.stand_dev)
+            args_dict["stdout"].write("Duplication rate: " + str(duplication_rate) + "\n")
+        if a.function == "single":
+            duplication_rate, len_reads_set = dup_rate_calc_single(a.gene_length, a.no_repeats, a.mean, a.stand_dev)
+            args_dict["stdout"].write("Duplication rate: " + str(duplication_rate) + "\n")
+        if a.function == "none" and a.sf_file_name != "none":
+            none(args_dict)
+
+    E.stop()
+
+
+###Reads in the content of a file and outputs each line as a list item in the list 'data'.
+def read_file(filename):
+    if not os.path.isfile(filename):
+        print("File", filename, "not found")
+        sys.exit()
+    fh = open(filename)
+    return fh
+
+
+###Generates random simulated reads.
+def read_gen(mu, sd, gene_length, min_length=0):
+    """Generates a simulated read where fragment length is chosen from a
+    truncated normal distribution
+    """
+
+    # Get truncation points in terms of number of SD
+    # from mean
+    a = (min_length - mu) / sd
+    b = (gene_length - mu) / sd
+
+    # Generate random number between 0 and gene length on a
+    # number of SD scale
+    sds_from_mean = truncnorm.rvs(a, b, size=1)[0]
+
+    # Convert back to Bp scale
+    bp_from_mean = sd * float(sds_from_mean)
+    fragment_length = mu + bp_from_mean
+
+    # Get closest integer
+    fragment_length = round(fragment_length, 0)
+    fragment_length = int(fragment_length)
+
+    if fragment_length == gene_length:
+        start_position = 0
+    else:
+        start_position = random.choice(range(gene_length - fragment_length))
+
+    read = (start_position, fragment_length)
+    return read
+
+
+###Using a probability distribution for the length of fragment.
+def alt_read_gen(frag_len_list, weight_data):
+    """Generate random read using the length data and weights provided"""
+
+    gene_length = len(frag_len_list)
+
+    fragment_length = int(choice(frag_len_list, 1, p=weight_data))
+
+    E.debug("Fragment length is:", fragment_length)
+
+    if fragment_length == gene_length:
+        start_position = 0
+    else:
+        start_position = random.choice(range(gene_length - fragment_length))
+
+    read = (start_position, fragment_length)
+    return read
+
+
+def calc_mean_sd(weights):
+    """Returns the average fragment_length and standard deviation,
+    calculated from a distribution of weights"""
+
+    frag_lens = arange(1, len(weights))
+    mean_length = average(frag_lens, weights=weights)
+    std_length = average((frag_lens - mean_length) ** 2, weights=weights)
+    return mean_length, std_length
+
+
+def dup_rate_calc(gene_length, no_repeats, mean_length, sd_length, weights=None):
+    """Takes a gene length and a number of repeats for that gene and outputs a
+    duplication_rate. WARNING: also changes global variable sw_dup_rate"""
+
+    reads_set = set()
+    n = 0
+
+    ###ALT READ GEN FUNCTION
+    if weights:
+
+        frag_len_list = arange(1, gene_length + 1)
+        c_weight_data = weights[:gene_length]
+        ###Recreate a total probablity of 1 for the distribution while preserving probablilty structure
+        re_normed_weights = c_weight_data / c_weight_data.sum()
+
+        while n < no_repeats:
+            # If the gene_length is longer than the weighted distribution of
+            # probabilities then there is still the possibility that the
+            # fragment may be longer but we don't know the specific
+            # probability of any one fragment length. By taking the mean and
+            # standard deviation of the probabilities in the flenDist we are
+            # able to calculate in a read in the standard way. This will
+            # occur 1-sum(all_flenDist_values)% of the time.
+
+            is_over = random.random() < (1 - sum(weights)) and \
+                      gene_length > len(weights)
+
+            if is_over:
+                read = read_gen(mean, sd, gene_length, min_length=len(weight_data))
+                E.debug('Choosing read beyond weighted data')
+            else:
+                read = alt_read_gen(frag_len_list, re_normed_weights)
+                E.debug('Choosing random fragment length up to : %i' % len(frag_len_list))
+
+                reads_set.add(read)
+                E.debug("Read-" + str(N + 1) + " len: " + str(read[1]))
+                n += 1
+
+    ###NORMAL READ GEN FUNCTION
+    else:
+        while n < no_repeats:
+            read = read_gen(mean_length, sd_length, gene_length)
+            reads_set.add(read)
+            n += 1
+            E.debug("Read-" + str(n + 1) + " len: %i" % read[1])
+
+    duplication_rate_inv = (float(len(reads_set)) / no_repeats) * 100
+    duplication_rate = 100 - duplication_rate_inv
+    E.debug("Duplication Rate: {0}".format(duplication_rate))
+    return duplication_rate, len(reads_set)
+
+#TODO Integrate this with dup_rate_calc as an option. Argument will need adding throughout.
+def dup_rate_calc_single(gene_length, no_repeats, mean_length, sd_length, weights=None):
+    """Takes a gene length and a number of repeats for that gene and outputs a
+    duplication_rate. WARNING: also changes global variable sw_dup_rate"""
+
+    reads_set = set()
+    n = 0
+
+    ###ALT READ GEN FUNCTION
+    if weights:
+
+        frag_len_list = arange(1, gene_length + 1)
+        c_weight_data = weights[:gene_length]
+        ###Recreate a total probablity of 1 for the distribution while preserving probablilty structure
+        re_normed_weights = c_weight_data / c_weight_data.sum()
+
+        while n < no_repeats:
+            # If the gene_length is longer than the weighted distribution of
+            # probabilities then there is still the possibility that the
+            # fragment may be longer but we don't know the specific
+            # probability of any one fragment length. By taking the mean and
+            # standard deviation of the probabilities in the flenDist we are
+            # able to calculate in a read in the standard way. This will
+            # occur 1-sum(all_flenDist_values)% of the time.
+
+            is_over = random.random() < (1 - sum(weights)) and \
+                      gene_length > len(weights)
+
+            if is_over:
+                read = read_gen(mean, sd, gene_length, min_length=len(weight_data))
+                E.debug('Choosing read beyond weighted data')
+            else:
+                read = alt_read_gen(frag_len_list, re_normed_weights)
+                read_ss, read_len = read
+                E.debug("Read Start Site: %i" %read_ss)
+                E.debug("Read Length: %i" %read_len)
+                E.debug('Choosing random fragment length up to : %i' % len(frag_len_list))
+
+                reads_set.add(read_ss)
+                n += 1
+
+    ###NORMAL READ GEN FUNCTION
+    else:
+        while n < no_repeats:
+            read = read_gen(mean_length, sd_length, gene_length)
+            read_ss, read_len = read
+            E.debug("Read Start Site: %i" % read_ss)
+            E.debug("Read Length: %i" % read_len)
+            reads_set.add(read_ss)
+            n += 1
+            E.debug("Read-" + str(n + 1) + " len: %i" % read[1])
+
+    duplication_rate_inv = (float(len(reads_set)) / no_repeats) * 100
+    duplication_rate = 100 - duplication_rate_inv
+    E.debug("Single Ended Duplication Rate: {0}".format(duplication_rate))
+    return duplication_rate, len(reads_set)
+
+
+def processfunc(id, child_conn, no_repeats, gene_length, mean_length, sd_length):
+    """Called by mp_dup_rate_calc. Runs individual instances of dup_rate_calc for each process."""
+
+    results = []
+    x = 0
+
+    while x < no_repeats:
+        results.append(dup_rate_calc(gene_length, no_repeats, mean_length, sd_length))
+        x += 1
+
+        if child_conn is None:
+            E.info("child_conn is NONE")
+            return results
+        else:
+            child_conn.send(results)
+            child_conn.close()
+            E.debug("Process {0} is finished.".format(str(id)))
+    print(results)
+
+#TODO: Finish this function!
+def mp_dup_rate_calc(gene_length, no_repeats, mean_length, sd_length, weights=None, no_processes=4,):
+    """Multi-processing version of dup_rate_calc, able to split work by number of user-defined processes.
+       Takes a gene length and a number of repeats for that gene and outputs a
+       duplication_rate. WARNING: also changes global variable sw_dup_rate"""
+
+    process_work = int(math.ceil(float(no_repeats) / float(no_processes)))
+    list_start = 0
+    my_pipes = []
+    results = []
+    compiled_results = []
+    id = 1
+
+    E.debug("Number of Processes Started: {0}".format(str(no_processes)))
+    E.debug("Process Work: {0}".format(str(process_work)))
+
+    while list_start < no_repeats:
+
+        #Define work parameters for each process.
+        list_end = min(list_start + process_work, no_repeats)
+        no_repeats_tp = len(range(list_start, list_end))
+
+        if list_end == no_repeats:
+            # Use main process as one of the processes, saves creating any processes if 1 is sufficient and main does
+            # not have to just sit around waiting for others
+            results = processfunc(id, None, no_repeats_tp, gene_length, mean_length, sd_length)
+
+        else:
+            # Set up child processes
+            my_conn, child_conn = mp.Pipe(False)
+            p = mp.Process(target=processfunc, args=(id, child_conn, no_repeats, gene_length, mean_length, sd_length,))
+            p.start()
+            my_pipes.append(my_conn)
+
+        list_start += process_work
+        id += 1
+
+    #Collate pipe results
+    for pipe in my_pipes:
+        compiled_results += pipe.recv()
+
+    compiled_results += results
+    E.info("Number of Duplication Rates Calculated: {0}".format(str(len(compiled_results))))
+
+    return duplication_rate, len(read_set)
+
+
+def get_weights_filename(sf_file_name, dist_path=None):
+    if dist_path == "none":
+        fn = "flenDist.txt"
+    else:
+        fn = os.path.join(sf_file_name[:-3], dist_path)
+
+    return fn
+
+
+def sf_parser(sf_file_name, args_dict, weights_file=None):
+    """Takes an sf file for each line simulates that number of reads from a gene that length.
+    Writes an output file with the per-transcript and the per file duplication rate and
+    returns the duplication rate"""
+
+    reads = {}
+    data = read_file(sf_file_name)
+    data.readline()
+
+    i = 1
+
+    total_unique_reads = 0.0
+    total_reads = 0.0
+
+    results = []
+
+    if weights_file:
+        data = read_file(weights_file)
+        weight_data = data[0].split()
+        weight_data = array(map(float, weight_data))
+        mean_length, std_length = calc_mean_sd(weight_data)
+    else:
+        weight_data = None
+        mean_length = args_dict["mean"]
+        std_length = args_dict["stand_dev"]
+
+    for line in data:
+        sline = line.strip()
+        columns = sline.split()
+        gene_length = int(float(columns[1]))
+        no_repeats = int(float(columns[4]))
+        transcript_id = columns[0]
+
+        if no_repeats == 0:
+            reads[transcript_id] = 0
+            dup_rate = 0.0
+            E.debug("Number of repeats (%i) equals zero, therefore duplication rate is 0 by default." % no_repeats)
+            results.append([transcript_id, str(dup_rate)])
+            continue
+
+        E.debug("Number of repeats (%i)" % no_repeats)
+
+        '''Changes the function if single-ended duplication rate is specified.'''
+        if args_dict["function"]=="single":
+            E.info("Simulating single-ended reads.")
+            dup_rate, simulated_no_repeats = dup_rate_calc_single(gene_length, no_repeats,
+                                                       mean_length, std_length,
+                                                        weight_data)
+        else:
+            dup_rate, simulated_no_repeats = dup_rate_calc(gene_length, no_repeats,
+                                                           mean_length, std_length,
+                                                            weight_data)
+
+        total_unique_reads += simulated_no_repeats
+        total_reads += no_repeats
+
+        E.debug("\n".join([transcript_id + "\t" + str(dup_rate),
+                           "Line from File: " + sline,
+                           "Read in Gene Length from File: %i" % gene_length,
+                           "Read in No_Repeats from File: %i" % no_repeats]))
+
+        results.append([transcript_id, str(dup_rate)])
+
+        # TODO: Currently no way to call this
+        if i % 300 == 0:
+            percent_complete = (i / len(data)) * 100
+            sys.stdout.write('\r')
+            sys.stdout.write(str(percent_complete))
+            sys.stdout.flush()
+            i += 1
+
+    sw_dup_rate = 100 - (total_unique_reads / total_reads * 100)
+
+    args_dict["stdout"].write("sample_name\ttranscript_id\tdup_rate\n")
+    for line in results:
+        args_dict["stdout"].write(sf_file_name + "\t".join(line) + "\n") # TODO: Take filename off of end of "sf_file_name" so when sf_dir_parser runs path is not included although ensure still works when sf parser is run directly
+
+    args_dict["stdout"].write("Sample Wide Duplication Rate = " + str(sw_dup_rate) + "\n")
+    args_dict["stdout"].write("---\tFILE END\t---\n")
+
+    return sw_dup_rate
+
+
+def sf_directory_parser(directory, args_dict):
+    E.info("Calculating from directory " + os.path.dirname(directory))
+    sw_dup_rate_d = {}
+    for filename in os.listdir(directory):
+        if filename.endswith("deduped.sf"):
+            pass
+        elif filename.endswith(".sf"):
+            E.info("Starting duplication calculation of " + filename)
+            stime = time.time()
+
+            path = os.path.join(directory, filename)
+
+            if args_dict["alt_read_gen"]:
+                weights_file = get_weights_filename(path, args_dict["dist_path"])
+            else:
+                weights_file = None
+
+            sw_dup_rate = sf_parser(path, args_dict, weights_file)
+            sw_dup_rate_d.update({filename: sw_dup_rate})
+            timetaken = time.time() - stime
+            E.info("Finished calculation of %s after %f seconds" % (filename, timetaken))
+        else:
+            pass
+    args_dict["stdout"].write("Sample Wide Duplication Rates for all Samples:\n")
+    for key in sw_dup_rate_d:
+        args_dict["stdout"].write(key + "\t" + str(sw_dup_rate_d[key])+"\n")
+
+
+
+main()
