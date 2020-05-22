@@ -32,10 +32,10 @@ def main():
     ###Basic parameters
     parser.add_option("-g", "--gene-length", type=int, default=1500,
                       help="Set length of gene from which to generate reads. Defaults to 1500.")
-    parser.add_option("-m", "--mean", type=int, default=200,
-                      help="Set mean read length for generation. Defaults to 200.")
-    parser.add_option("-s", "--stand-dev", type=int, default=30,
-                      help="Sets standard deviation of read lengths. Defaults to 30.")
+    parser.add_option("-m", "--mean", type=int, default=220,
+                      help="Set mean read length for generation. Defaults to 220.")
+    parser.add_option("-s", "--stand-dev", type=int, default=60,
+                      help="Sets standard deviation of read lengths. Defaults to 60.")
     parser.add_option("-r", "--no-repeats", type=int, default=1000,
                       help="Sets number of repeats. Defaults to 1000.")
     parser.add_option("-x", "--function", default="",
@@ -62,7 +62,7 @@ def main():
     parser.add_option("-d", "--sf-file-dir", default="none",
                       help='''Sets the directory of sf files to use with the other selected functions. Defaults to no 
                                 directory.''')
-    parser.add_option("-p", "--dist-path", default="/libParams/flenDist.txt",
+    parser.add_option("-p", "--dist-path", default="libParams/flenDist.txt",
                       help='''Sets the path to the distribution file. Looks for the form SAMPLENAME + path. If none is
                         set, defaults to searching standard salmon folder of SAMPLENAME/libParams/flenDist.txt''')
     ###Bias
@@ -135,7 +135,7 @@ def main():
 ###Reads in the content of a file and outputs each line as a list item in the list 'data'.
 def read_file(filename):
     if not os.path.isfile(filename):
-        print("File", filename, "not found")
+        E.warn("File " + filename + " not found")
         sys.exit()
     fh = open(filename)
     return fh
@@ -195,8 +195,13 @@ def alt_read_gen(frag_len_list, weight_data):
 def calc_mean_sd(weights):
     """Returns the average fragment_length and standard deviation,
     calculated from a distribution of weights"""
-
-    frag_lens = arange(1, len(weights))
+    E.debug(weights)
+    frag_lens = arange(1, len(weights)+1)
+    E.debug(frag_lens)
+    E.debug(len(frag_lens))
+    E.debug(len(weights))
+    E.debug(type(frag_lens))
+    E.debug(type(weights))
     mean_length = average(frag_lens, weights=weights)
     std_length = average((frag_lens - mean_length) ** 2, weights=weights)
     return mean_length, std_length
@@ -210,7 +215,7 @@ def dup_rate_calc(gene_length, no_repeats, mean_length, sd_length, weights=None)
     n = 0
 
     ###ALT READ GEN FUNCTION
-    if weights:
+    if weights != None:
 
         frag_len_list = arange(1, gene_length + 1)
         c_weight_data = weights[:gene_length]
@@ -230,14 +235,14 @@ def dup_rate_calc(gene_length, no_repeats, mean_length, sd_length, weights=None)
                       gene_length > len(weights)
 
             if is_over:
-                read = read_gen(mean, sd, gene_length, min_length=len(weight_data))
+                read = read_gen(mean_length, sd_length, gene_length, min_length=len(re_normed_weights))
                 E.debug('Choosing read beyond weighted data')
             else:
-                read = alt_read_gen(frag_len_list, re_normed_weights)
+                read = alt_read_gen(frag_len_list[:len(re_normed_weights)], re_normed_weights)
                 E.debug('Choosing random fragment length up to : %i' % len(frag_len_list))
 
                 reads_set.add(read)
-                E.debug("Read-" + str(N + 1) + " len: " + str(read[1]))
+                E.debug("Read-" + str(n + 1) + " len: " + str(read[1]))
                 n += 1
 
     ###NORMAL READ GEN FUNCTION
@@ -378,10 +383,12 @@ def mp_dup_rate_calc(gene_length, no_repeats, mean_length, sd_length, weights=No
 
 
 def get_weights_filename(sf_file_name, dist_path=None):
-    if dist_path == "none":
-        fn = "flenDist.txt"
+    if dist_path == "libParams/flenDist.txt":
+        E.debug("Default path used,")
+        fn = os.path.join(sf_file_name[:-3], "libParams/flenDist.txt")
     else:
-        fn = os.path.join(sf_file_name[:-3], dist_path)
+        E.debug("Custom path used.")
+        fn = dist_path
 
     return fn
 
@@ -401,16 +408,31 @@ def sf_parser(sf_file_name, args_dict, weights_file=None):
     total_reads = 0.0
 
     results = []
-
+    
+    if args_dict["alt_read_gen"]:
+        weights_file = get_weights_filename(sf_file_name, args_dict["dist_path"])
+        E.debug("SF Parser has called a weights file.")
+        E.debug(weights_file)
+        
+    
     if weights_file:
-        data = read_file(weights_file)
-        weight_data = data[0].split()
-        weight_data = array(map(float, weight_data))
+        E.info(weights_file)
+        w_data = read_file(weights_file)
+        x=1
+        for line in w_data:
+            if x==1:
+                weight_data = line.split()
+            x+=1
+
+        weight_data = list(map(float, weight_data))
+        weight_data = array(weight_data)
         mean_length, std_length = calc_mean_sd(weight_data)
+        E.info("Successfully found weights file.")
     else:
         weight_data = None
         mean_length = args_dict["mean"]
         std_length = args_dict["stand_dev"]
+        E.warn("Weights file not found, using defaults.")
 
     for line in data:
         sline = line.strip()
@@ -440,6 +462,7 @@ def sf_parser(sf_file_name, args_dict, weights_file=None):
                                                             weight_data)
 
         total_unique_reads += simulated_no_repeats
+
         total_reads += no_repeats
 
         E.debug("\n".join([transcript_id + "\t" + str(dup_rate),
@@ -457,7 +480,11 @@ def sf_parser(sf_file_name, args_dict, weights_file=None):
             sys.stdout.flush()
             i += 1
 
-    sw_dup_rate = 100 - (total_unique_reads / total_reads * 100)
+    if total_reads == 0:
+        sw_dup_rate = 0
+        E.debug("Not right.")
+    else:
+        sw_dup_rate = 100 - (total_unique_reads / total_reads * 100)
 
     args_dict["stdout"].write("sample_name\ttranscript_id\tdup_rate\n")
     for line in results:
@@ -480,9 +507,11 @@ def sf_directory_parser(directory, args_dict):
             stime = time.time()
 
             path = os.path.join(directory, filename)
+            E.info(path)
 
             if args_dict["alt_read_gen"]:
                 weights_file = get_weights_filename(path, args_dict["dist_path"])
+                E.debug(weights_file)
             else:
                 weights_file = None
 
